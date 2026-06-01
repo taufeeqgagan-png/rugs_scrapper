@@ -3,12 +3,13 @@ from collections import deque
 from playwright.async_api import async_playwright
 from discord_webhook import DiscordWebhook, DiscordEmbed
 from datetime import datetime
+import os   # ← NEW LINE
 
-# ←←← PASTE YOUR 4 WEBHOOK URLS HERE (one per line)
-ALL_WEBHOOK_URL = "https://discord.com/api/webhooks/1508178745985601689/Z2BRQd8MyDUSeE8G29eGfZlK8iX_ztAPQP6YywWkUM23vC6MnTKvswKvYHOQAwlG1O6f"
-LONG_WEBHOOK_URL = "https://discord.com/api/webhooks/1508074485629321246/hMR3IhGqcOkHnrLUroFJcikMOCMK9RjbApmfToDDCzy2jX-cYL5qc795OuVMybkmaTfn"
-HUNDREDX_WEBHOOK_URL = "https://discord.com/api/webhooks/1508178898972577940/RetnNzKSrGeZnREb3Jxj_BQFrdYXxvhTRGm5aDvp7uYnxv44d2zIYLo8Fn60gNKR1LCW"
-INSTA_WEBHOOK_URL = "https://discord.com/api/webhooks/1508179356697231600/4V0TusNcBpdHsdg5Y-16jXLvmEkQNL7ui4hq0y27tlG4cXqlV0ltW-7uEl-EA-7eVt4y"
+# ←←← Webhooks from Railway Environment Variables
+ALL_WEBHOOK_URL = os.getenv("ALL_WEBHOOK_URL")
+LONG_WEBHOOK_URL = os.getenv("LONG_WEBHOOK_URL")
+HUNDREDX_WEBHOOK_URL = os.getenv("HUNDREDX_WEBHOOK_URL")
+INSTA_WEBHOOK_URL = os.getenv("INSTA_WEBHOOK_URL")
 
 CHECK_INTERVAL = 12
 
