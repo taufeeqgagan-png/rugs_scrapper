@@ -3,13 +3,14 @@ from collections import deque
 from playwright.async_api import async_playwright
 from discord_webhook import DiscordWebhook, DiscordEmbed
 from datetime import datetime
-import os   # ← NEW LINE
+import os
 
-# ←←← Webhooks from Railway Environment Variables
+# ←←← Webhooks from Railway Environment Variables (DO NOT change these lines)
 ALL_WEBHOOK_URL = os.getenv("ALL_WEBHOOK_URL")
 LONG_WEBHOOK_URL = os.getenv("LONG_WEBHOOK_URL")
 HUNDREDX_WEBHOOK_URL = os.getenv("HUNDREDX_WEBHOOK_URL")
 INSTA_WEBHOOK_URL = os.getenv("INSTA_WEBHOOK_URL")
+
 
 CHECK_INTERVAL = 12
 
@@ -20,14 +21,15 @@ rounds_since_long = 0
 rounds_since_100x = 0
 rounds_since_insta = 0
 
+
 async def send_webhook(url, title, desc):
-if not url or url == "PASTE_..._HERE":
-return
-webhook = DiscordWebhook(url=url)
-embed = DiscordEmbed(title=title, description=desc, color=0x00ff00)
-embed.add_embed_field(name="Live Main Chart", value="https://rugs.fun/", inline=False)
-webhook.add_embed(embed)
-webhook.execute()
+    if not url or url == "PASTE_..._HERE":
+        return
+    webhook = DiscordWebhook(url=url)
+    embed = DiscordEmbed(title=title, description=desc, color=0x00ff00)
+    embed.add_embed_field(name="Live Main Chart", value="https://rugs.fun/", inline=False)
+    webhook.add_embed(embed)
+    webhook.execute()
 
 async def main():
 global last_id, total_rounds, rounds_since_long, rounds_since_100x, rounds_since_insta
