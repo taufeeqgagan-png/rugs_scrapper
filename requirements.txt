@@ -1,2 +1,2 @@
-playwright
-discord-webhook
+playwright==1.52.0
+discord-webhook==1.3.1
