@@ -1,22 +1,21 @@
-# ✅ Use the official Playwright Python image.
-# It includes Chromium + ALL required system libraries pre-installed.
-# No need to manually apt-get install dozens of libs.
+# Official Playwright Python image — Chromium + all system libs pre-installed
 FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
 
-# Keep Python output unbuffered so logs appear in Railway instantly
+# Unbuffered logs so Railway shows output in real time
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
-# Install Python dependencies first (layer-cached unless requirements.txt changes)
+# Install Python deps (layer-cached unless requirements.txt changes)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Chromium browser (already available in the image, this just confirms it)
+# Confirm Chromium is installed (already in the base image)
 RUN playwright install chromium
 
-# Copy the rest of your project
+# Copy project files
 COPY . .
 
+# ✅ FIX: filename is main.py (no spaces — Railway can't handle "main (1).py")
 CMD ["python", "main.py"]
