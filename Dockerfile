@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Install system dependencies required for Playwright/Chromium
+# Install system dependencies for Playwright/Chromium
 RUN apt-get update && apt-get install -y \
     wget \
     curl \
@@ -33,20 +33,17 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy requirements first for better caching
+# Copy requirements first
 COPY requirements.txt .
 
-# Install Python packages
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright and Chromium browser + dependencies
+# Install Playwright Chromium
 RUN playwright install chromium --with-deps
 
-# Copy the rest of your project
+# Copy all your files
 COPY . .
 
-# Make sure your script is executable (optional)
-RUN chmod +x bot.py
-
-# Command to run your bot
-CMD ["python", "bot.py"]
+# Run your main script
+CMD ["python", "main.py"]
