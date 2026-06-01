@@ -5,12 +5,11 @@ from discord_webhook import DiscordWebhook, DiscordEmbed
 from datetime import datetime
 import os
 
-# ←←← Webhooks from Railway Environment Variables (DO NOT change these lines)
+# Webhooks from Environment Variables
 ALL_WEBHOOK_URL = os.getenv("ALL_WEBHOOK_URL")
 LONG_WEBHOOK_URL = os.getenv("LONG_WEBHOOK_URL")
 HUNDREDX_WEBHOOK_URL = os.getenv("HUNDREDX_WEBHOOK_URL")
 INSTA_WEBHOOK_URL = os.getenv("INSTA_WEBHOOK_URL")
-
 
 CHECK_INTERVAL = 12
 
@@ -25,11 +24,15 @@ rounds_since_insta = 0
 async def send_webhook(url, title, desc):
     if not url or url == "PASTE_..._HERE":
         return
-    webhook = DiscordWebhook(url=url)
-    embed = DiscordEmbed(title=title, description=desc, color=0x00ff00)
-    embed.add_embed_field(name="Live Main Chart", value="https://rugs.fun/", inline=False)
-    webhook.add_embed(embed)
-    webhook.execute()
+    try:
+        webhook = DiscordWebhook(url=url)
+        embed = DiscordEmbed(title=title, description=desc, color=0x00ff00)
+        embed.add_embed_field(name="Live Main Chart", value="https://rugs.fun/", inline=False)
+        webhook.add_embed(embed)
+        webhook.execute()
+    except Exception as e:
+        print(f"Webhook error: {e}")
+
 
 async def main():
     global last_id, total_rounds, rounds_since_long, rounds_since_100x, rounds_since_insta
@@ -78,30 +81,26 @@ async def main():
 
                     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-                    # 1. ALL CHARTS - every round
                     await send_webhook(ALL_WEBHOOK_URL, "📊 ALL CHARTS",
                         f"**Round ended** · #{total_rounds}\n⏱ Duration: **{dur}s** | 💥 Multiplier: **{mult:.2f}x**\n`{ts}`")
 
-                    # 2. LONG ROUND
                     if is_long:
                         await send_webhook(LONG_WEBHOOK_URL, "🐋 LONG ROUND!",
-                            f"Duration: **{dur}s** (≥130 s) | Multiplier: **{mult:.2f}x**\nLong round came after **{rounds_since_long}** rounds since the last one")
+                            f"Duration: **{dur}s** (≥130 s) | Multiplier: **{mult:.2f}x**")
                         rounds_since_long = 0
                     else:
                         rounds_since_long += 1
 
-                    # 3. 100x+ ROUND
                     if is_100x:
                         await send_webhook(HUNDREDX_WEBHOOK_URL, "🚀 100x+ ROUND!",
-                            f"Multiplier: **{mult:.2f}x** | Duration: **{dur}s**\n100x+ came after **{rounds_since_100x}** rounds since the last one")
+                            f"Multiplier: **{mult:.2f}x** | Duration: **{dur}s**")
                         rounds_since_100x = 0
                     else:
                         rounds_since_100x += 1
 
-                    # 4. INSTA-RUG
                     if is_insta:
                         await send_webhook(INSTA_WEBHOOK_URL, "💥 INSTA-RUG!",
-                            f"Duration: **{dur}s** (≤5 s) | Multiplier: **{mult:.2f}x**\nInsta-rug came after **{rounds_since_insta}** rounds since the last one")
+                            f"Duration: **{dur}s** (≤5 s) | Multiplier: **{mult:.2f}x**")
                         rounds_since_insta = 0
                     else:
                         rounds_since_insta += 1
@@ -109,6 +108,10 @@ async def main():
                     last_id = latest['id']
 
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Error in loop: {e}")
 
             await asyncio.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
