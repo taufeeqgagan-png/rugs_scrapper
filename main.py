@@ -1,162 +1,304 @@
 import asyncio
+import json
+import re
 from collections import deque
 from playwright.async_api import async_playwright
 from discord_webhook import DiscordWebhook, DiscordEmbed
 from datetime import datetime, timezone
 import os
 
-# Webhooks from Railway Environment Variables
-ALL_WEBHOOK_URL = os.getenv("ALL_WEBHOOK_URL")
-LONG_WEBHOOK_URL = os.getenv("LONG_WEBHOOK_URL")
+# ── Webhooks from Railway Environment Variables ───────────────────────────────
+ALL_WEBHOOK_URL      = os.getenv("ALL_WEBHOOK_URL")
+LONG_WEBHOOK_URL     = os.getenv("LONG_WEBHOOK_URL")
 HUNDREDX_WEBHOOK_URL = os.getenv("HUNDREDX_WEBHOOK_URL")
-INSTA_WEBHOOK_URL = os.getenv("INSTA_WEBHOOK_URL")
+INSTA_WEBHOOK_URL    = os.getenv("INSTA_WEBHOOK_URL")
 
-CHECK_INTERVAL = 12
+CHECK_INTERVAL = 10
 
-history = deque(maxlen=500)
-last_id = None
-total_rounds = 0
-rounds_since_long = 0
-rounds_since_100x = 0
+history            = deque(maxlen=500)
+last_id            = None
+total_rounds       = 0
+rounds_since_long  = 0
+rounds_since_100x  = 0
 rounds_since_insta = 0
+
+ws_queue: asyncio.Queue = asyncio.Queue()
+
+# How many raw WS frames to print (helps us learn the message format quickly)
+WS_DEBUG_FRAMES_LIMIT = 60
+ws_debug_count = 0
 
 BROWSER_CRASH_ERRORS = (
     "Target crashed",
     "Target page, context or browser has been closed",
     "Browser has been closed",
     "Connection closed",
-    "page.evaluate",
     "context or browser",
 )
 
 
-async def send_webhook(url, title, desc):
-    if not url or url == "PASTE_..._HERE":
+# ── Discord helper ─────────────────────────────────────────────────────────────
+async def send_webhook(url, title, desc, color=0x00ff00):
+    if not url:
+        print(f"  ⚠️  Webhook URL not set for: {title}")
         return
     def _send():
         webhook = DiscordWebhook(url=url)
-        embed = DiscordEmbed(title=title, description=desc, color=0x00ff00)
-        embed.add_embed_field(name="Live Main Chart", value="https://rugs.fun/", inline=False)
+        embed   = DiscordEmbed(title=title, description=desc, color=color)
+        embed.add_embed_field(name="Live Chart", value="https://rugs.fun/", inline=False)
         webhook.add_embed(embed)
         webhook.execute()
     try:
         await asyncio.get_event_loop().run_in_executor(None, _send)
-        print(f"✅ Webhook sent: {title}")
+        print(f"  ✅ Webhook sent: {title}")
     except Exception as e:
-        print(f"Webhook error: {e}")
+        print(f"  ❌ Webhook error: {e}")
 
 
-async def scrape_round(page):
-    """
-    Multi-strategy scraper for rugs.fun round history.
-    Tries class-based selectors first, then falls back to
-    scanning all elements for multiplier + duration text patterns.
-    """
+# ── Process a completed round ─────────────────────────────────────────────────
+async def process_round(mult: float, dur: int, round_id: str):
+    global last_id, total_rounds, rounds_since_long, rounds_since_100x, rounds_since_insta
+
+    if round_id == last_id:
+        print(f"  ↳ Duplicate round {round_id!r} — skipping.")
+        return
+
+    last_id = round_id
+    total_rounds += 1
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    is_long  = dur  >= 130
+    is_100x  = mult >= 100
+    is_insta = dur  <= 5
+
+    flags = "".join([
+        "  🐋 LONG"  if is_long  else "",
+        "  🚀 100x"  if is_100x  else "",
+        "  💥 INSTA" if is_insta else "",
+    ])
+    print(f"  🎯 NEW ROUND #{total_rounds} → {mult:.2f}x | {dur}s{flags}")
+
+    await send_webhook(
+        ALL_WEBHOOK_URL,
+        "📊 Round Ended",
+        f"**Round #{total_rounds}**\n"
+        f"⏱ Duration: **{dur}s** · 💥 Multiplier: **{mult:.2f}x**\n"
+        f"`{ts}`",
+    )
+
+    if is_long:
+        await send_webhook(LONG_WEBHOOK_URL, "🐋 LONG ROUND!",
+            f"Duration: **{dur}s** ≥ 130 s | Multiplier: **{mult:.2f}x**", 0x1d8fe1)
+        rounds_since_long = 0
+    else:
+        rounds_since_long += 1
+
+    if is_100x:
+        await send_webhook(HUNDREDX_WEBHOOK_URL, "🚀 100x ROUND!",
+            f"Multiplier: **{mult:.2f}x** | Duration: **{dur}s**", 0xffd700)
+        rounds_since_100x = 0
+    else:
+        rounds_since_100x += 1
+
+    if is_insta:
+        await send_webhook(INSTA_WEBHOOK_URL, "💥 INSTA-RUG!",
+            f"Duration: **{dur}s** ≤ 5 s | Multiplier: **{mult:.2f}x**", 0xff0000)
+        rounds_since_insta = 0
+    else:
+        rounds_since_insta += 1
+
+
+# ── Deep key search: find a value by many possible key names ──────────────────
+def deep_get(d, *keys):
+    """Search a nested dict for any of the given keys. Returns first match."""
+    if not isinstance(d, dict):
+        return None
+    for k, v in d.items():
+        if k.lower() in [x.lower() for x in keys]:
+            return v
+        if isinstance(v, dict):
+            result = deep_get(v, *keys)
+            if result is not None:
+                return result
+        if isinstance(v, list):
+            for item in v:
+                result = deep_get(item, *keys) if isinstance(item, dict) else None
+                if result is not None:
+                    return result
+    return None
+
+
+# ── WebSocket handler ──────────────────────────────────────────────────────────
+def make_ws_handler():
+    async def on_websocket(ws):
+        print(f"  🔌 WebSocket opened: {ws.url}")
+
+        async def on_frame(payload: str):
+            global ws_debug_count
+
+            # ── Always log raw frames for the first N messages so we can
+            #    see the actual format in Railway logs and tune accordingly.
+            if ws_debug_count < WS_DEBUG_FRAMES_LIMIT:
+                ws_debug_count += 1
+                print(f"  🔍 RAW WS [{ws_debug_count}/{WS_DEBUG_FRAMES_LIMIT}]: {str(payload)[:400]}")
+
+            # Handle binary / non-JSON frames
+            if not payload or not payload.strip().startswith(("{", "[")):
+                # Try to find JSON embedded in a binary-ish string
+                match = re.search(r'\{.*\}', str(payload))
+                if not match:
+                    return
+                payload = match.group(0)
+
+            try:
+                data = json.loads(payload)
+            except Exception:
+                return
+
+            # ── Flatten: if it's a list, check each element ──────────────
+            items = data if isinstance(data, list) else [data]
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                # Check for event type keywords anywhere in the message
+                raw_str = json.dumps(item).lower()
+                is_end = any(k in raw_str for k in [
+                    "round_end", "roundend", "game_end", "gameend",
+                    "crashed", "crash", "ended", "bust", "finish",
+                    "complete", "result", "history",
+                ])
+
+                # ── Extract multiplier (try every naming convention) ──────
+                mult = deep_get(item,
+                    "multiplier", "mult", "crashPoint", "crash_point",
+                    "finalMultiplier", "final_multiplier", "bustedAt",
+                    "busted_at", "endMultiplier", "end_multiplier",
+                    "value", "result", "x", "m",
+                )
+
+                # ── Extract duration ──────────────────────────────────────
+                dur = deep_get(item,
+                    "duration", "dur", "elapsed", "roundDuration",
+                    "round_duration", "time", "seconds", "length", "s",
+                )
+
+                # ── Extract round ID ──────────────────────────────────────
+                rid = str(deep_get(item,
+                    "roundId", "round_id", "id", "gameId", "game_id",
+                    "hash", "seed", "nonce",
+                ) or "")
+
+                # Also try to extract multiplier from text like "3.45x"
+                if mult is None:
+                    m = re.search(r'(\d+\.?\d*)x', raw_str)
+                    if m:
+                        mult = float(m.group(1))
+
+                # Duration from text like "42s"
+                if dur is None:
+                    m = re.search(r'"(\d+)"\s*s\b|(\d+)\s*s\b', raw_str)
+                    if m:
+                        dur = int(m.group(1) or m.group(2))
+
+                if mult is not None:
+                    try:
+                        mult_f = float(mult)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if mult_f > 0:
+                        dur_i = int(dur) if dur is not None else 0
+                        unique_id = rid or f"{mult_f}_{dur_i}_{datetime.now().timestamp():.0f}"
+
+                        if is_end or mult_f > 0:   # queue even without explicit end marker
+                            await ws_queue.put({
+                                "mult": mult_f,
+                                "dur":  dur_i,
+                                "id":   unique_id,
+                            })
+                            print(f"  📡 WS captured: {mult_f:.2f}x / {dur_i}s  (id={unique_id[:30]})")
+
+        ws.on("framereceived", lambda f: asyncio.ensure_future(on_frame(f.payload)))
+
+    return on_websocket
+
+
+# ── DOM fallback scraper ───────────────────────────────────────────────────────
+async def scrape_dom(page):
     return await page.evaluate("""() => {
-
-        // ── Strategy 1: known / guessed class patterns ──────────────────────
-        const candidates = [
-            '[class*="historyRow"]',
-            '[class*="HistoryRow"]',
-            '[class*="history-row"]',
-            '[class*="roundItem"]',
-            '[class*="RoundItem"]',
-            '[class*="round-item"]',
-            '[class*="history-item"]',
-            '[class*="HistoryItem"]',
-            '[class*="gameRow"]',
-            '[class*="GameRow"]',
-            '[class*="crashItem"]',
-            '[class*="CrashItem"]',
-            '[data-round-id]',
-            '[data-id]',
+        const selectors = [
+            '[class*="historyRow"]','[class*="HistoryRow"]','[class*="history-row"]',
+            '[class*="roundItem"]','[class*="RoundItem"]','[class*="round-item"]',
+            '[class*="history-item"]','[class*="HistoryItem"]',
+            '[class*="gameRow"]','[class*="GameRow"]',
+            '[class*="crashItem"]','[class*="CrashItem"]',
+            '[class*="betRow"]','[class*="BetRow"]',
+            '[data-round-id]','[data-id]',
         ];
-
-        let row = null;
-        let matchedSelector = null;
-
-        for (const sel of candidates) {
+        let row = null, matchedSelector = null;
+        for (const sel of selectors) {
             const el = document.querySelector(sel);
-            if (el) {
-                row = el;
-                matchedSelector = sel;
-                break;
-            }
+            if (el) { row = el; matchedSelector = sel; break; }
         }
-
-        // ── Strategy 2: DOM text scan ─────────────────────────────────────
-        // Walk every element looking for one that contains BOTH
-        // a multiplier (e.g. "1234.56x") and a duration (e.g. "45s")
-        // but isn't enormous (likely a wrapper).
         if (!row) {
-            const all = document.querySelectorAll('*');
-            for (const el of all) {
-                const childCount = el.children.length;
-                if (childCount > 6) continue;          // skip large containers
+            for (const el of document.querySelectorAll('*')) {
+                if (el.children.length > 8) continue;
                 const t = (el.textContent || '').trim();
-                if (t.length > 300) continue;          // skip huge text blobs
-                const hasMult = /\d+\.?\d*x/.test(t);
-                const hasDur  = /\d+\s*s\b/.test(t);
-                if (hasMult && hasDur) {
-                    row = el;
-                    matchedSelector = 'fallback-text-match';
-                    break;
+                if (t.length > 400) continue;
+                if (/\d+\.?\d*x/.test(t) && /\d+\s*s\b/.test(t)) {
+                    row = el; matchedSelector = 'text-scan'; break;
                 }
             }
         }
-
-        // ── Strategy 3: find multiplier span + nearby duration ────────────
-        // Some sites render the multiplier and duration in sibling spans.
         if (!row) {
-            const spans = document.querySelectorAll('span, div, td, li');
-            for (const el of spans) {
+            for (const el of document.querySelectorAll('span,div,td,li,p')) {
                 const t = (el.textContent || '').trim();
                 if (/^\d+\.?\d*x$/.test(t)) {
-                    // found a pure "1234.56x" element — grab its parent
-                    const parent = el.parentElement;
-                    if (parent) {
-                        const pt = parent.textContent || '';
-                        if (/\d+\s*s\b/.test(pt)) {
-                            row = parent;
-                            matchedSelector = 'sibling-span-match';
-                            break;
-                        }
+                    const p = el.parentElement;
+                    if (p && /\d+\s*s\b/.test(p.textContent || '')) {
+                        row = p; matchedSelector = 'sibling-span'; break;
                     }
                 }
             }
         }
-
         if (!row) {
-            // Log the full page text snippet to help with debugging
-            const bodySnippet = (document.body && document.body.innerText || '').slice(0, 500);
-            return { debug: 'NO_ROW_FOUND', id: null, mult: 0, dur: 0, bodySnippet };
+            const snippet = (document.body && document.body.innerText || '').slice(0, 500);
+            return { debug:'NO_ROW_FOUND', id:null, mult:0, dur:0, bodySnippet: snippet };
         }
-
         const text = row.textContent || '';
         const multMatch = text.match(/(\d+\.?\d*)x/);
         const timeMatch = text.match(/(\d+)\s*s\b/);
-
-        // Build a stable ID from data attributes or the text content itself
-        const id =
-            row.getAttribute('data-round-id') ||
-            row.getAttribute('data-id') ||
-            row.getAttribute('id') ||
-            text.slice(0, 120).replace(/\s+/g, '');
-
+        const id = row.getAttribute('data-round-id') || row.getAttribute('data-id') ||
+                   row.getAttribute('id') || text.slice(0, 120).replace(/\s+/g,'');
         return {
             debug: matchedSelector,
-            id: id,
+            id:   id,
             mult: parseFloat(multMatch ? multMatch[1] : 0),
-            dur: parseInt(timeMatch ? timeMatch[1] : 0),
+            dur:  parseInt(timeMatch   ? timeMatch[1]  : 0),
         };
     }""")
 
 
+# ── Main loop ──────────────────────────────────────────────────────────────────
 async def main():
-    global last_id, total_rounds, rounds_since_long, rounds_since_100x, rounds_since_insta
-
     retry_delay = 8
-    max_delay = 120
+    max_delay   = 120
+
+    # Validate env vars at startup so you see immediately if something's missing
+    print("=" * 55)
+    print("  rugs.fun Discord Alert Bot — starting up")
+    print("=" * 55)
+    for name, val in [
+        ("ALL_WEBHOOK_URL",      ALL_WEBHOOK_URL),
+        ("LONG_WEBHOOK_URL",     LONG_WEBHOOK_URL),
+        ("HUNDREDX_WEBHOOK_URL", HUNDREDX_WEBHOOK_URL),
+        ("INSTA_WEBHOOK_URL",    INSTA_WEBHOOK_URL),
+    ]:
+        status = "✅ set" if val else "❌ NOT SET — notifications won't send!"
+        print(f"  {name}: {status}")
+    print("=" * 55)
 
     while True:
         try:
@@ -168,12 +310,11 @@ async def main():
                         "--disable-setuid-sandbox",
                         "--disable-dev-shm-usage",
                         "--disable-gpu",
-                        # ❌ REMOVED --single-process  → caused "Target crashed" loops
                         "--disable-blink-features=AutomationControlled",
                         "--disable-extensions",
                         "--disable-software-rasterizer",
                         "--js-flags=--max-old-space-size=512",
-                    ]
+                    ],
                 )
 
                 context = await browser.new_context(
@@ -182,110 +323,90 @@ async def main():
                 )
                 page = await context.new_page()
 
-                # Block heavy static assets we don't need
+                # ✅ Do NOT block fonts — rugs.fun gates rendering on font load.
+                #    Only block images/video we truly don't need.
                 await page.route(
-                    "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}",
+                    "**/*.{png,jpg,jpeg,gif,webp,svg,mp4,mp3,ogg,wav}",
                     lambda r: r.abort()
                 )
 
+                # ✅ Attach WS listener BEFORE navigating so we don't miss
+                #    the first frames that fire right after page load.
+                page.on("websocket", make_ws_handler())
+
                 print("🌐 Loading rugs.fun ...")
-                await page.goto("https://rugs.fun/", wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(15)   # give the JS app time to render
+                await page.goto("https://rugs.fun/", wait_until="domcontentloaded", timeout=45000)
+
+                # ✅ Wait until the actual app is rendered (not just DOM loaded)
+                print("⏳ Waiting for app to finish rendering ...")
+                try:
+                    await page.wait_for_function(
+                        """() => {
+                            const t = document.body && document.body.innerText || '';
+                            return t.length > 100 &&
+                                   !t.includes('Installing fonts') &&
+                                   !t.includes('Loading...');
+                        }""",
+                        timeout=60000,
+                    )
+                    print("✅ App rendered!")
+                except Exception:
+                    print("⚠️  Render wait timed out — proceeding anyway.")
+
+                await asyncio.sleep(8)   # let WS connect and initial history arrive
 
                 try:
-                    await page.get_by_text("Standard", exact=True).first.click(timeout=10000)
-                    print("✅ Switched to MAIN OG Standard chart")
+                    await page.get_by_text("Standard", exact=True).first.click(timeout=8000)
+                    print("✅ Clicked Standard chart tab")
+                    await asyncio.sleep(3)
                 except Exception:
-                    print("✅ Already on main chart (or button not found)")
+                    print("ℹ️  Standard tab not found — already on main chart")
 
-                print("🤖 Watching the main OG chart 24/7 ...")
-                retry_delay = 8   # reset back-off after a clean start
+                print("\n🤖 Watching 24/7 — waiting for rounds ...\n")
+                retry_delay = 8
 
                 while True:
                     try:
-                        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Checking for new round ...")
-                        await asyncio.sleep(4)
+                        now = datetime.now(timezone.utc).strftime('%H:%M:%S')
+                        print(f"[{now}] Checking ...")
 
-                        latest = await scrape_round(page)
+                        # Priority 1 — drain WebSocket queue
+                        ws_hit = False
+                        while not ws_queue.empty():
+                            item = await ws_queue.get()
+                            ws_hit = True
+                            await process_round(item["mult"], item["dur"], item["id"])
 
-                        # Always log so you can see what's happening in Railway logs
-                        print(
-                            f"  ↳ selector={latest.get('debug','?')} | "
-                            f"mult={latest.get('mult',0)} | "
-                            f"dur={latest.get('dur',0)}"
-                        )
+                        if ws_hit:
+                            await asyncio.sleep(CHECK_INTERVAL)
+                            continue
 
-                        # If NO_ROW_FOUND, print a body snippet to help debug
-                        if latest.get('debug') == 'NO_ROW_FOUND' and latest.get('bodySnippet'):
-                            print(f"  ↳ PAGE SNIPPET: {latest['bodySnippet'][:300]}")
+                        # Priority 2 — DOM fallback
+                        latest = await scrape_dom(page)
+                        debug  = latest.get("debug", "?")
+                        mult   = latest.get("mult", 0)
+                        dur    = latest.get("dur", 0)
 
-                        if latest and latest['mult'] > 0:
-                            print(f"  ↳ Detected → {latest['mult']:.2f}x | {latest['dur']}s")
+                        print(f"  ↳ selector={debug} | mult={mult} | dur={dur}")
 
-                            if latest['id'] != last_id:
-                                print("✅ New round! Sending notifications ...")
-                                mult = latest['mult']
-                                dur  = latest['dur']
-                                is_long  = dur >= 130
-                                is_100x  = mult >= 100
-                                is_insta = dur <= 5
-                                total_rounds += 1
-                                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-                                await send_webhook(
-                                    ALL_WEBHOOK_URL,
-                                    "📊 ALL CHARTS",
-                                    f"**Round ended** · #{total_rounds}\n"
-                                    f"⏱ Duration: **{dur}s** | 💥 Multiplier: **{mult:.2f}x**\n"
-                                    f"`{ts}`"
-                                )
-
-                                if is_long:
-                                    await send_webhook(
-                                        LONG_WEBHOOK_URL,
-                                        "🐋 LONG ROUND!",
-                                        f"Duration: **{dur}s** (≥130 s) | Multiplier: **{mult:.2f}x**"
-                                    )
-                                    rounds_since_long = 0
-                                else:
-                                    rounds_since_long += 1
-
-                                if is_100x:
-                                    await send_webhook(
-                                        HUNDREDX_WEBHOOK_URL,
-                                        "🚀 100x+ ROUND!",
-                                        f"Multiplier: **{mult:.2f}x** | Duration: **{dur}s**"
-                                    )
-                                    rounds_since_100x = 0
-                                else:
-                                    rounds_since_100x += 1
-
-                                if is_insta:
-                                    await send_webhook(
-                                        INSTA_WEBHOOK_URL,
-                                        "💥 INSTA-RUG!",
-                                        f"Duration: **{dur}s** (≤5 s) | Multiplier: **{mult:.2f}x**"
-                                    )
-                                    rounds_since_insta = 0
-                                else:
-                                    rounds_since_insta += 1
-
-                                last_id = latest['id']
-                            else:
-                                print("  ↳ Same round as last check — waiting.")
+                        if debug == "NO_ROW_FOUND":
+                            print(f"  ↳ PAGE: {latest.get('bodySnippet','')[:250]}")
+                            print("  ↳ No DOM data yet — retrying.")
+                        elif mult > 0:
+                            rid = latest.get("id") or f"{mult}_{dur}"
+                            await process_round(mult, dur, str(rid))
                         else:
-                            print("  ↳ No valid round data yet.")
+                            print("  ↳ Row found but mult=0 — round still live.")
 
                     except Exception as e:
                         err = str(e)
                         print(f"❌ Inner loop error: {e}")
                         if any(sig in err for sig in BROWSER_CRASH_ERRORS):
-                            print("🚨 Browser/page gone — restarting browser ...")
-                            break   # break inner loop → triggers full browser restart
+                            print("🚨 Browser gone — restarting ...")
+                            break
 
                     await asyncio.sleep(CHECK_INTERVAL)
 
-                # Clean up before restart
                 try:
                     await browser.close()
                 except Exception:
