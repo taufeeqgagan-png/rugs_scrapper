@@ -24,9 +24,15 @@ rounds_since_insta = 0
 
 ws_queue: asyncio.Queue = asyncio.Queue()
 
-# How many raw WS frames to print (helps us learn the message format quickly)
-WS_DEBUG_FRAMES_LIMIT = 60
-ws_debug_count = 0
+# Known noise events to silently skip
+WS_NOISE_EVENTS = {
+    "general:onlineCount", "newChatMessage", "maintenanceUpdate",
+    "pinpointPartyEventUpdate", "serverTime", "sideBetEvent",
+    "sidebetevent",
+}
+
+# Event names we've already logged (to avoid spam)
+ws_seen_events: set = set()
 
 BROWSER_CRASH_ERRORS = (
     "Target crashed",
@@ -134,91 +140,102 @@ def make_ws_handler():
         print(f"  🔌 WebSocket opened: {ws.url}")
 
         async def on_frame(payload: str):
-            global ws_debug_count
+            global ws_seen_events
+            raw = str(payload).strip()
 
-            # ── Always log raw frames for the first N messages so we can
-            #    see the actual format in Railway logs and tune accordingly.
-            if ws_debug_count < WS_DEBUG_FRAMES_LIMIT:
-                ws_debug_count += 1
-                print(f"  🔍 RAW WS [{ws_debug_count}/{WS_DEBUG_FRAMES_LIMIT}]: {str(payload)[:400]}")
-
-            # Handle binary / non-JSON frames
-            if not payload or not payload.strip().startswith(("{", "[")):
-                # Try to find JSON embedded in a binary-ish string
-                match = re.search(r'\{.*\}', str(payload))
-                if not match:
-                    return
-                payload = match.group(0)
+            # ── Parse Socket.IO format: 42["eventName", {...}] ───────────
+            # Socket.IO prepends "42" (message type) before the JSON array.
+            # Strip any leading digits before the first "[" or "{".
+            json_str = re.sub(r'^\d+', '', raw)
+            if not json_str:
+                return
 
             try:
-                data = json.loads(payload)
+                parsed = json.loads(json_str)
             except Exception:
                 return
 
-            # ── Flatten: if it's a list, check each element ──────────────
-            items = data if isinstance(data, list) else [data]
+            # Socket.IO event: ["eventName", payload1, payload2, ...]
+            if isinstance(parsed, list) and len(parsed) >= 1:
+                event_name = str(parsed[0]).lower()
+                payloads   = parsed[1:]
+            elif isinstance(parsed, dict):
+                event_name = "raw_object"
+                payloads   = [parsed]
+            else:
+                return
 
-            for item in items:
+            # ── Skip known noise ──────────────────────────────────────────
+            if event_name in WS_NOISE_EVENTS:
+                return
+
+            # ── Log every NEW event name we see (helps identify round-end) 
+            if event_name not in ws_seen_events:
+                ws_seen_events.add(event_name)
+                print(f"  🔍 NEW EVENT TYPE: {event_name!r}  sample={json_str[:200]}")
+
+            # ── Only process events that look like round completions ───────
+            # We check the event name AND the payload for round-end signals.
+            name_is_round_end = any(k in event_name for k in [
+                "crash", "round", "game", "bust", "end", "result",
+                "finish", "complete", "history", "chart",
+            ])
+
+            for item in payloads:
                 if not isinstance(item, dict):
                     continue
 
-                # Check for event type keywords anywhere in the message
-                raw_str = json.dumps(item).lower()
-                is_end = any(k in raw_str for k in [
-                    "round_end", "roundend", "game_end", "gameend",
-                    "crashed", "crash", "ended", "bust", "finish",
-                    "complete", "result", "history",
-                ])
+                raw_item = json.dumps(item).lower()
 
-                # ── Extract multiplier (try every naming convention) ──────
+                # Extract multiplier
                 mult = deep_get(item,
                     "multiplier", "mult", "crashPoint", "crash_point",
                     "finalMultiplier", "final_multiplier", "bustedAt",
                     "busted_at", "endMultiplier", "end_multiplier",
-                    "value", "result", "x", "m",
+                    "crashedAt", "crashed_at",
                 )
 
-                # ── Extract duration ──────────────────────────────────────
-                dur = deep_get(item,
+                # Extract duration (in seconds — rugs.fun may send ms, handle both)
+                dur_raw = deep_get(item,
                     "duration", "dur", "elapsed", "roundDuration",
-                    "round_duration", "time", "seconds", "length", "s",
+                    "round_duration", "elapsedTime", "elapsed_time",
+                    "timeElapsed", "time_elapsed", "length",
                 )
 
-                # ── Extract round ID ──────────────────────────────────────
+                # Extract round ID
                 rid = str(deep_get(item,
                     "roundId", "round_id", "id", "gameId", "game_id",
                     "hash", "seed", "nonce",
                 ) or "")
 
-                # Also try to extract multiplier from text like "3.45x"
                 if mult is None:
-                    m = re.search(r'(\d+\.?\d*)x', raw_str)
-                    if m:
-                        mult = float(m.group(1))
+                    continue
 
-                # Duration from text like "42s"
-                if dur is None:
-                    m = re.search(r'"(\d+)"\s*s\b|(\d+)\s*s\b', raw_str)
-                    if m:
-                        dur = int(m.group(1) or m.group(2))
+                try:
+                    mult_f = float(mult)
+                except (ValueError, TypeError):
+                    continue
 
-                if mult is not None:
+                if mult_f <= 0:
+                    continue
+
+                # Convert duration — if > 10000 assume milliseconds
+                dur_i = 0
+                if dur_raw is not None:
                     try:
-                        mult_f = float(mult)
+                        dur_f = float(dur_raw)
+                        dur_i = int(dur_f / 1000) if dur_f > 10000 else int(dur_f)
                     except (ValueError, TypeError):
-                        continue
+                        dur_i = 0
 
-                    if mult_f > 0:
-                        dur_i = int(dur) if dur is not None else 0
-                        unique_id = rid or f"{mult_f}_{dur_i}_{datetime.now().timestamp():.0f}"
+                # Only queue if event name suggests a round end
+                if not name_is_round_end:
+                    print(f"  ⚠️  Skipping {event_name!r} — has mult={mult_f} but not a round-end event")
+                    continue
 
-                        if is_end or mult_f > 0:   # queue even without explicit end marker
-                            await ws_queue.put({
-                                "mult": mult_f,
-                                "dur":  dur_i,
-                                "id":   unique_id,
-                            })
-                            print(f"  📡 WS captured: {mult_f:.2f}x / {dur_i}s  (id={unique_id[:30]})")
+                unique_id = rid or f"{mult_f}_{dur_i}_{datetime.now().timestamp():.0f}"
+                await ws_queue.put({"mult": mult_f, "dur": dur_i, "id": unique_id})
+                print(f"  📡 WS captured: {mult_f:.2f}x / {dur_i}s  event={event_name!r}")
 
         ws.on("framereceived", lambda f: asyncio.ensure_future(on_frame(f["data"] if isinstance(f, dict) else str(f))))
 
