@@ -220,7 +220,7 @@ def make_ws_handler():
                             })
                             print(f"  📡 WS captured: {mult_f:.2f}x / {dur_i}s  (id={unique_id[:30]})")
 
-        ws.on("framereceived", lambda f: asyncio.ensure_future(on_frame(f.payload)))
+        ws.on("framereceived", lambda f: asyncio.ensure_future(on_frame(f["data"] if isinstance(f, dict) else str(f))))
 
     return on_websocket
 
